@@ -1,0 +1,30 @@
+# 評価プログラムの設定
+
+# 比較する2つのモデル名（outputs.jsonl の "model" と一致させる）
+compare:
+  base: base      # 未学習モデル
+  target: lora    # QLoRA 追加学習済みモデル
+
+# 指標3：形式遵守率
+format:
+  speakers: [A, B]          # 許可する話者ラベル
+  min_turns: 4              # 最低ターン数（発話の数）※要相談
+  require_alternation: true # A と B が交互に話すこと
+  first_speaker: null       # 例: A にすると「A から始まる」も条件に入る
+
+# 指標1：BERTScore
+bertscore:
+  model_type: cl-tohoku/bert-base-japanese-v3
+  num_layers: 9             # 使う隠れ層（12層中9層目）
+  batch_size: 16
+  device: auto              # auto / cuda / cpu
+
+# 指標2：人的評価
+human_eval:
+  criteria: [自然さ, 内容の正確性, 一貫性]
+  scale: 5                  # 1〜5 の5段階
+  seed: 42                  # 提示順シャッフルの乱数シード
+  descriptions:
+    自然さ: 実際の日本人同士の日常会話として自然か（翻訳調・不自然な敬語がないか）
+    内容の正確性: 元の文章の事実・数値が変わらず、抜けもなく伝わっているか
+    一貫性: 話者の役割（A=聞き手、B=説明役）や話の流れが最後まで一貫しているか

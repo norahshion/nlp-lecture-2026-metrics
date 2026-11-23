@@ -1,0 +1,10 @@
+eval/results/
+group-f_構想 (1).pptx
+pred_base.jsonl
+pred_lora.jsonl
+eval/__pycache__/
+eval/results_sample/
+eval/human_sample/
+eval/results_sample_auto/
+eval/results_sample_manual/
+eval/human_sample_manual/

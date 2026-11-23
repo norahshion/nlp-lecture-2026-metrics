@@ -1,0 +1,9 @@
+pyyaml
+pandas
+scipy
+openpyxl
+matplotlib
+transformers
+bert-score
+fugashi
+unidic-lite

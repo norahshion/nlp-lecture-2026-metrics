@@ -18,6 +18,12 @@
 
 既にシートや対応表があるフォルダには作成しない（上書きは --overwrite を付けたときだけ）。
 集計では、評価対象・評価項目・基準の版・対応表がシートと一致しなければ停止する。
+
+規則による採点（final のみ。config.yaml の human_eval.auto_score）:
+  出力が空・英語など日本語以外の出力は、人が読まなくても点が決まるためシートに載せず、規則で点を付ける。
+  どの件をシートに載せ、どの件を規則で採点したかは selection.csv に残す。
+  規則で付けた点は平均・検定には入れ、評価者間の一致度（α）には入れない。
+  --sample-ids N で、入力（id）を N 個選んで評価する（base と lora は対のまま残す）。
 """
 from __future__ import annotations
 
@@ -36,12 +42,15 @@ from openpyxl.utils import get_column_letter
 from openpyxl.utils.exceptions import IllegalCharacterError
 from openpyxl.worksheet.datavalidation import DataValidation
 
+import metric_format
 from common import ROOT, load_config, load_records, paired_test
 
 SHEET_NAME = "評価"
 META_SHEET = "_meta"
 KEY_FILE = "key.csv"
 META_FILE = "meta.json"
+SELECTION_FILE = "selection.csv"
+SCOPES = {"all": "全件（規則による採点を含む）", "human": "人が評価した件のみ"}
 REASON_COL = "評価不能の理由"
 COMMENT_COL = "コメント"
 NOTE_COL = "表示上の注意"
@@ -67,6 +76,64 @@ def raw_cell_text(raws: list[str]) -> str:
     """生出力を分割境界つきで順番どおりに並べる。本文は加工しない。"""
     n = len(raws)
     return "\n\n".join(f"{chunk_marker(i, n, x)}\n{x}" for i, x in enumerate(raws, 1))
+
+
+def _output_hash(r: dict) -> str:
+    return hashlib.sha256(r["output"].encode("utf-8")).hexdigest()[:16]
+
+
+def auto_rules(cfg: dict, target: str) -> dict:
+    """規則による採点の設定。raw では使わない（生出力は分割ごとに状態が違うため）。"""
+    a = cfg["human_eval"].get("auto_score") or {}
+    if target != "final" or not a.get("enabled"):
+        return {}
+    criteria, unable = list(cfg["human_eval"]["criteria"]), cfg["human_eval"].get("unable_label", "評価不能")
+    rules = a.get("rules") or {}
+    for status, rule in rules.items():
+        if status not in ("出力なし", "不合格"):
+            raise HumanEvalError(f"auto_score の条件は「出力なし」「不合格」だけです（{status}）")
+        if set(rule.get("scores", {})) != set(criteria):
+            raise HumanEvalError(f"auto_score の「{status}」に全評価項目の点がありません")
+        for c, v in rule["scores"].items():
+            if parse_cell(v, int(cfg["human_eval"]["scale"]), unable)[0] not in ("数値", "評価不能"):
+                raise HumanEvalError(f"auto_score の「{status}」の {c} の値が不正です: {v!r}")
+    return rules
+
+
+def select_items(records: list[dict], cfg: dict, sample_ids: int | None,
+                 rules: dict) -> tuple[list[dict], pd.DataFrame]:
+    """シートに載せる件を選ぶ。返り値: (シートに載せる records, 全件の選別結果 selection)。
+
+    selection 列: sheet（人が評価）/ auto（規則で採点）/ not_sampled（抽出されず評価しない）
+    """
+    hcfg = cfg["human_eval"]
+    models = {cfg["compare"]["base"], cfg["compare"]["target"]}
+    recs = [r for r in records if r["model"] in models]
+    chosen = None
+    if sample_ids is not None:
+        ids = sorted({r["id"] for r in recs})
+        if not 1 <= sample_ids <= len(ids):
+            raise HumanEvalError(f"--sample-ids は 1〜{len(ids)} で指定してください（入力の数 {len(ids)}）")
+        chosen = set(random.Random(f"{hcfg['seed']}-sample").sample(ids, sample_ids))
+    criteria = list(hcfg["criteria"])
+    rows, sheet = [], []
+    for r in recs:
+        ja = metric_format.check_japanese(r["output"], cfg)["ja_status"]
+        row = {"id": r["id"], "set": r["set"], "model": r["model"], "ja_status": ja,
+               "output_sha256": _output_hash(r), "rule": "", "reason": "", **{c: "" for c in criteria}}
+        if chosen is not None and r["id"] not in chosen:
+            row["selection"] = "not_sampled"
+        elif ja in rules:
+            rule = rules[ja]
+            row.update(selection="auto", rule=ja, reason=rule["reason"])
+            row.update({c: str(rule["scores"][c]) for c in criteria})
+        else:
+            row["selection"] = "sheet"
+            sheet.append(r)
+        rows.append(row)
+    if not sheet:
+        raise HumanEvalError("人が評価する件が1件もありません（すべて規則で採点されるか、抽出されませんでした）")
+    return sheet, pd.DataFrame(rows)
 
 
 def build_items(records: list[dict], cfg: dict, target: str) -> list[dict]:
@@ -105,26 +172,37 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _meta(cfg: dict, target: str, key_hash: str, n_items: int, dummy: bool) -> dict:
+def _meta(cfg: dict, target: str, key_hash: str, n_items: int, dummy: bool,
+          sel_hash: str | None = None, rules: dict | None = None, sample_ids: int | None = None,
+          counts: dict | None = None) -> dict:
     h = cfg["human_eval"]
     return {"target": target, "criteria": list(h["criteria"]), "criteria_version": h.get("criteria_version"),
-            "scale": int(h["scale"]), "key_sha256": key_hash, "n_items": n_items, "dummy_scores": dummy}
+            "scale": int(h["scale"]), "key_sha256": key_hash, "n_items": n_items, "dummy_scores": dummy,
+            "selection_sha256": sel_hash, "auto_score_rules": rules or {}, "sample_ids": sample_ids,
+            "selection_counts": counts or {}}
 
 
 def make_sheets(records: list[dict], cfg: dict, out_dir: Path, raters: list[str], *,
-                target: str = "final", dummy_scores: bool = False, overwrite: bool = False) -> list[Path]:
+                target: str = "final", dummy_scores: bool = False, overwrite: bool = False,
+                sample_ids: int | None = None, auto: bool = True) -> list[Path]:
     if target not in TARGETS:
         raise HumanEvalError(f"--target は {TARGETS} のどれかです")
     hcfg = cfg["human_eval"]
     criteria, scale, unable = list(hcfg["criteria"]), int(hcfg["scale"]), hcfg.get("unable_label", "評価不能")
     names = raters or ["template"]
 
-    existing = [p for p in [out_dir / KEY_FILE, out_dir / META_FILE, *out_dir.glob("sheet_*.xlsx")] if p.exists()]
+    existing = [p for p in [out_dir / KEY_FILE, out_dir / META_FILE, out_dir / SELECTION_FILE,
+                            *out_dir.glob("sheet_*.xlsx")] if p.exists()]
     if existing and not overwrite:
         raise HumanEvalError(f"{out_dir} には既に評価シート等があります（{', '.join(p.name for p in existing)}）。"
                              "別のフォルダを指定するか、作り直す場合だけ --overwrite を付けてください")
 
-    items = build_items(records, cfg, target)
+    rules = auto_rules(cfg, target) if auto else {}
+    if sample_ids is not None or rules:
+        sheet_recs, selection = select_items(records, cfg, sample_ids, rules)
+    else:
+        sheet_recs, selection = records, None
+    items = build_items(sheet_recs, cfg, target)
     random.Random(f"{hcfg['seed']}-{target}").shuffle(items)
     keyed = [{**it, "item_id": f"{'H' if target == 'final' else 'R'}{i:03d}"} for i, it in enumerate(items, 1)]
 
@@ -139,7 +217,18 @@ def make_sheets(records: list[dict], cfg: dict, out_dir: Path, raters: list[str]
     key = pd.DataFrame([{"item_id": it["item_id"], "id": it["id"], "set": it["set"], "model": it["model"],
                          "target": target} for it in keyed])
     key.to_csv(out_dir / KEY_FILE, index=False, encoding="utf-8-sig")
-    meta = _meta(cfg, target, _sha256(out_dir / KEY_FILE), len(keyed), dummy_scores)
+    stale = out_dir / SELECTION_FILE
+    sel_hash, counts = None, {}
+    if selection is not None:
+        selection.to_csv(stale, index=False, encoding="utf-8-sig")
+        sel_hash = _sha256(stale)
+        lab = selection["selection"] + selection["rule"].map(lambda x: f"({x})" if x else "")
+        counts = {f"{s}/{m}": {k: int(v) for k, v in g.value_counts().items()}
+                  for (s, m), g in lab.groupby([selection["set"], selection["model"]])}
+    else:
+        stale.unlink(missing_ok=True)  # --overwrite で作り直したとき、前の選別結果を残さない
+    meta = _meta(cfg, target, _sha256(out_dir / KEY_FILE), len(keyed), dummy_scores,
+                 sel_hash, rules, sample_ids, counts)
     (out_dir / META_FILE).write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
     paths = []
@@ -189,7 +278,8 @@ def make_sheets(records: list[dict], cfg: dict, out_dir: Path, raters: list[str]
         ws.column_dimensions[reason_col].width = 18
         ws.column_dimensions[get_column_letter(last + 2)].width = 30
 
-        _write_info_sheet(wb.create_sheet("説明"), name, target, hcfg, scale, unable, dummy_scores)
+        _write_info_sheet(wb.create_sheet("説明"), name, target, hcfg, scale, unable, dummy_scores,
+                          bool(rules), sample_ids)
 
         ms = wb.create_sheet(META_SHEET)
         ms["A1"] = json.dumps(meta, ensure_ascii=False)
@@ -202,7 +292,7 @@ def make_sheets(records: list[dict], cfg: dict, out_dir: Path, raters: list[str]
     return paths
 
 
-def _write_info_sheet(info, name, target, hcfg, scale, unable, dummy):
+def _write_info_sheet(info, name, target, hcfg, scale, unable, dummy, auto=False, sample_ids=None):
     bold = Font(bold=True)
     info.append(["評価者", name])
     if dummy:
@@ -218,6 +308,11 @@ def _write_info_sheet(info, name, target, hcfg, scale, unable, dummy):
                          f"下の目安は 1・3・5 点のもので、2・4 はその中間です。"
                          f"判断できない項目は「{unable}」と記入し、「{REASON_COL}」を選んでください。"])
     info.append(["注意", "どのモデルの出力かは伏せてあります。入力文と見比べて評価してください。"])
+    if auto:
+        info.append(["載せていない件", "出力が空のもの・英語など日本語以外の出力は、点が規則で決まるため"
+                                  "このシートには載せていません（集計時に規則どおりの点を加えます）。"])
+    if sample_ids:
+        info.append(["抽出", f"評価の負担を減らすため、入力を {sample_ids} 個だけ選んで載せています。"])
     info.append([])
     info.append(["特別な場合の扱い"])
     info.cell(info.max_row, 1).font = bold
@@ -357,25 +452,90 @@ def load_filled(human_dir: Path, cfg: dict, target: str) -> pd.DataFrame | None:
     if invalid:
         raise HumanEvalError("1〜{0} の整数・「{1}」・空欄以外の値があります: ".format(scale, unable) + "; ".join(invalid[:20]))
     detail = pd.DataFrame(frames).merge(key, on="item_id", how="left")
-    n_no_reason = (detail["unable_reason"] == "（理由未記入）").sum()
+    detail["source"] = "人"
+    # 1つも記入していない評価者は、規則の点も置かない（置くと規則で採点した件だけ重くなる）
+    filled = sorted(detail.loc[detail["status"] != "未記入", "rater"].unique())
+    blank = sorted(set(detail["rater"]) - set(filled))
+    if blank:
+        print(f"  [注意] すべて空欄のシートがあります（平均・規則の点に含めません）: {', '.join(blank)}")
+    selection = load_selection(human_dir, meta)
+    if selection is not None:
+        auto = selection[selection["selection"] == "auto"]
+        rows = []
+        for _, a in auto.iterrows():
+            for rater in filled:  # 記入した評価者ごとに同じ点を置く（1件あたりの重みを人が評価した件とそろえる）
+                for c in criteria:
+                    status, score = parse_cell(a[c], scale, unable)
+                    rows.append({"rater": rater, "item_id": "", "criterion": c, "status": status, "score": score,
+                                 "unable_reason": a["reason"] if status == "評価不能" else "",
+                                 "id": a["id"], "set": a["set"], "model": a["model"], "target": target,
+                                 "source": "規則", "rule": a["rule"]})
+        if rows:
+            detail = pd.concat([detail, pd.DataFrame(rows)], ignore_index=True)
+    detail["rule"] = detail.get("rule", pd.Series("", index=detail.index)).fillna("")
+    n_no_reason = ((detail["unable_reason"] == "（理由未記入）") & (detail["source"] == "人")).sum()
     if n_no_reason:
         print(f"  [注意] 理由が選ばれていない「{unable}」が {n_no_reason} 個あります")
     return detail
 
 
-def aggregate(detail: pd.DataFrame, cfg: dict, target: str) -> dict[str, pd.DataFrame]:
-    base, target_model = cfg["compare"]["base"], cfg["compare"]["target"]
+def load_selection(human_dir: Path, meta: dict) -> pd.DataFrame | None:
+    """selection.csv（どの件をシートに載せ、どの件を規則で採点したか）。旧形式のフォルダでは None。"""
+    h = meta.get("selection_sha256")
+    if not h:
+        return None
+    path = human_dir / SELECTION_FILE
+    if not path.exists():
+        raise HumanEvalError(f"{human_dir} に {SELECTION_FILE} がありません（規則による採点の記録が必要です）")
+    if _sha256(path) != h:
+        raise HumanEvalError(f"{SELECTION_FILE} がシート作成時から変わっています")
+    return pd.read_csv(path, encoding="utf-8-sig", dtype=str, keep_default_na=False)
+
+
+def _summary(detail: pd.DataFrame, target: str, scope: str) -> pd.DataFrame:
     both = pd.concat([detail, detail.assign(set="ALL")])
     g = both.groupby(["set", "model", "criterion"])
     summary = g["score"].agg(["mean", "std"]).round(3)
+    summary["n_items"] = g["id"].nunique()
+    # 平均に使われた件数（数値が1つ以上ある件）。評価不能ばかりの項目は平均の根拠が少ない
+    summary["n_items_scored"] = both[both["status"] == "数値"].groupby(["set", "model", "criterion"])["id"].nunique()
+    summary["n_items_scored"] = summary["n_items_scored"].fillna(0).astype(int)
     summary["n_valid"] = g["status"].apply(lambda s: (s == "数値").sum())
     summary["n_unable"] = g["status"].apply(lambda s: (s == "評価不能").sum())
     summary["n_blank"] = g["status"].apply(lambda s: (s == "未記入").sum())
+    summary["n_rule"] = g["source"].apply(lambda s: (s == "規則").sum())
     summary["n_total"] = g.size()
     summary = summary.reset_index()
+    summary.insert(0, "scope", SCOPES[scope])
     summary.insert(0, "target", target)
+    return summary
 
-    valid = detail[detail["status"] == "数値"]
+
+def coverage(detail: pd.DataFrame, selection: pd.DataFrame | None) -> pd.DataFrame:
+    """データ×モデルごとの件数（人が評価・規則で採点・抽出外）。"""
+    if selection is None:  # 旧形式：シートに載った件だけ
+        sel = detail[detail["source"] == "人"][["id", "set", "model"]].drop_duplicates().assign(selection="sheet", rule="")
+    else:
+        sel = selection
+    both = pd.concat([sel, sel.assign(set="ALL")])
+    rows = []
+    for (s, m), g in both.groupby(["set", "model"]):
+        auto = g[g["selection"] == "auto"]
+        rows.append({"set": s, "model": m, "n_total": len(g),
+                     "n_人が評価": int((g["selection"] == "sheet").sum()),
+                     "n_規則_出力なし": int((auto["rule"] == "出力なし").sum()),
+                     "n_規則_日本語以外": int((auto["rule"] == "不合格").sum()),
+                     "n_抽出外": int((g["selection"] == "not_sampled").sum())})
+    return pd.DataFrame(rows)
+
+
+def aggregate(detail: pd.DataFrame, cfg: dict, target: str,
+              selection: pd.DataFrame | None = None) -> dict[str, pd.DataFrame]:
+    base, target_model = cfg["compare"]["base"], cfg["compare"]["target"]
+    human = detail[detail["source"] == "人"]
+    summary = pd.concat([_summary(detail, target, "all"), _summary(human, target, "human")], ignore_index=True)
+
+    valid = human[human["status"] == "数値"]  # 一致度は人が付けた点だけ（規則の点は全員同じになるため）
     alpha_rows = []
     for crit in cfg["human_eval"]["criteria"]:
         gc = valid[valid["criterion"] == crit]
@@ -387,17 +547,70 @@ def aggregate(detail: pd.DataFrame, cfg: dict, target: str) -> dict[str, pd.Data
     alpha = pd.DataFrame(alpha_rows)
 
     # 評価者平均（数値のみ）をとってから、同じ入力どうしで base と lora を比べる。n は有効な組の数
-    per_item = valid.groupby(["set", "id", "model", "criterion"])["score"].mean().reset_index()
     test_rows = []
-    for (s, crit), gg in pd.concat([per_item, per_item.assign(set="ALL")]).groupby(["set", "criterion"]):
-        test_rows.append({"set": s, "metric": f"人的評価({target}):{crit}",
-                          **paired_test(gg, "score", base, target_model)})
+    for scope, d, label in (("all", detail, target), ("human", human, f"{target}・人のみ")):
+        v = d[d["status"] == "数値"]
+        per_item = v.groupby(["set", "id", "model", "criterion"])["score"].mean().reset_index()
+        for (s, crit), gg in pd.concat([per_item, per_item.assign(set="ALL")]).groupby(["set", "criterion"]):
+            test_rows.append({"set": s, "metric": f"人的評価({label}):{crit}",
+                              **paired_test(gg, "score", base, target_model)})
     tests = pd.DataFrame(test_rows)
 
     unable = detail[detail["status"] == "評価不能"]
-    reasons = (unable.groupby(["model", "criterion", "unable_reason"]).size().rename("count").reset_index()
-               if len(unable) else pd.DataFrame(columns=["model", "criterion", "unable_reason", "count"]))
-    return {"summary": summary, "alpha": alpha, "tests": tests, "reasons": reasons}
+    cols = ["source", "model", "criterion", "unable_reason"]
+    reasons = (unable.groupby(cols).size().rename("count").reset_index()
+               if len(unable) else pd.DataFrame(columns=[*cols, "count"]))
+    return {"summary": summary, "alpha": alpha, "tests": tests, "reasons": reasons,
+            "coverage": coverage(detail, selection)}
+
+
+def match_records(human_dir: Path, records: list[dict], target: str = "final") -> str:
+    """シートが評価対象の outputs と同じデータから作られたかを確かめる。
+
+    返り値: "none"（シートなし）/ "unrelated"（id が1件も一致しない＝別データのシート）/ "match"。
+    一部だけ一致する・表示された対話が outputs と違う場合は HumanEvalError。
+    """
+    sheets = sorted(p for p in human_dir.glob("sheet_*.xlsx") if p.stem != "sheet_template")
+    key_path = human_dir / KEY_FILE
+    if not sheets or not key_path.exists():
+        return "none"
+    key = pd.read_csv(key_path, encoding="utf-8-sig", dtype=str)
+    rec = {(str(r["id"]), str(r["set"]), str(r["model"])): r for r in records}
+    pairs = list(zip(key["id"], key["set"], key["model"]))
+    found = [p for p in pairs if p in rec]
+    if not found:
+        return "unrelated"
+    meta_path = human_dir / META_FILE
+    meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
+    selection = load_selection(human_dir, meta)
+    if selection is not None:
+        sel_pairs = list(zip(selection["id"], selection["set"], selection["model"]))
+        missing = [p for p in sel_pairs if p not in rec]
+        if missing:
+            raise HumanEvalError(f"{human_dir} の選別結果の {len(missing)} 件が評価対象の outputs にありません"
+                                 f"（例: {', '.join(f'{i}({s},{m})' for i, s, m in missing[:3])}）")
+        changed = [f"{p[0]}({p[2]})" for p, h in zip(sel_pairs, selection["output_sha256"])
+                   if _output_hash(rec[p]) != h]
+        if changed:
+            raise HumanEvalError(f"{human_dir} の作成後に出力が変わっています: " + ", ".join(changed[:5]))
+    missing = [p for p in pairs if p not in rec]
+    if missing:
+        raise HumanEvalError(f"{human_dir} のシートの {len(missing)} 件が評価対象の outputs にありません"
+                             f"（例: {', '.join(f'{i}({s},{m})' for i, s, m in missing[:3])}）。"
+                             "別のデータのシートが混ざっていないか確認してください")
+    # シートに表示した対話が今の outputs と同じか（変換し直しなどで中身が変わっていないか）
+    ws = load_workbook(sheets[0], read_only=True)[SHEET_NAME]
+    shown = {row[0]: row[2] or "" for row in ws.iter_rows(min_row=2, max_col=3, values_only=True)}
+    changed = []
+    for item_id, p in zip(key["item_id"], pairs):
+        r = rec[p]
+        expected = r["output"] if target == "final" else raw_cell_text(r.get("raw_outputs") or [])
+        if shown.get(item_id) != expected:
+            changed.append(f"{item_id}={p[0]}({p[2]})")
+    if changed:
+        raise HumanEvalError(f"{human_dir} のシートに表示した対話が、評価対象の outputs と違います: "
+                             + ", ".join(changed[:5]) + "。シート作成後に出力が変わった可能性があります")
+    return "match"
 
 
 def run_aggregate(human_dir: Path, cfg: dict, target: str = "final") -> dict[str, pd.DataFrame] | None:
@@ -405,7 +618,8 @@ def run_aggregate(human_dir: Path, cfg: dict, target: str = "final") -> dict[str
     detail = load_filled(human_dir, cfg, target)
     if detail is None:
         return None
-    res = aggregate(detail, cfg, target)
+    meta = json.loads((human_dir / META_FILE).read_text(encoding="utf-8"))
+    res = aggregate(detail, cfg, target, load_selection(human_dir, meta))
     res["detail"] = detail
     return res
 
@@ -423,6 +637,10 @@ def main():
     mk.add_argument("--dummy-scores", action="store_true",
                     help="見本データ専用。仮点数を埋め、既定では human_sample/<target>/ に保存")
     mk.add_argument("--overwrite", action="store_true", help="既存のシート・対応表があっても作り直す")
+    mk.add_argument("--sample-ids", type=int, default=None,
+                    help="入力（id）を N 個選んで評価する（base と lora は対のまま。seed で固定）")
+    mk.add_argument("--no-auto-score", action="store_true",
+                    help="規則による採点をせず、空・日本語以外の出力もシートに載せる")
     ag = sub.add_parser("aggregate", help="記入済みシートを集計")
     ag.add_argument("--target", choices=TARGETS, default="final")
     ag.add_argument("--results", default=None, help="既定: results/human_<target>/")
@@ -441,7 +659,14 @@ def main():
     try:
         if args.cmd == "make":
             paths = make_sheets(load_records(args.outputs), cfg, human_dir, args.raters, target=args.target,
-                                dummy_scores=dummy_scores, overwrite=args.overwrite)
+                                dummy_scores=dummy_scores, overwrite=args.overwrite,
+                                sample_ids=args.sample_ids, auto=not args.no_auto_score)
+            sel = human_dir / SELECTION_FILE
+            if sel.exists():
+                s = pd.read_csv(sel, encoding="utf-8-sig", dtype=str, keep_default_na=False)
+                lab = s["selection"] + s["rule"].map(lambda x: f"({x})" if x else "")
+                print("選別結果（sheet=人が評価 / auto=規則で採点 / not_sampled=抽出外）:")
+                print(pd.crosstab([s["set"], s["model"]], lab).to_string())
             print(f"評価対象: {args.target}（{TARGET_LABEL[args.target]}）")
             print("作成しました:", *[str(p) for p in paths], sep="\n  ")
             print(f"対応表（評価が終わるまで評価者には見せない）: {human_dir / KEY_FILE}")
@@ -452,10 +677,10 @@ def main():
                 return
             out = Path(args.results) if args.results else ROOT / "results" / f"human_{args.target}"
             out.mkdir(parents=True, exist_ok=True)
-            for name in ("detail", "summary", "alpha", "tests", "reasons"):
+            for name in ("detail", "summary", "alpha", "tests", "reasons", "coverage"):
                 res[name].to_csv(out / f"{name}.csv", index=False, encoding="utf-8-sig")
             with pd.option_context("display.width", 200, "display.max_columns", 20):
-                for name in ("summary", "alpha", "tests", "reasons"):
+                for name in ("coverage", "summary", "alpha", "tests", "reasons"):
                     print(f"\n== {name} ==\n{res[name].to_string(index=False)}")
             print(f"\n結果を {out} に保存しました（評価対象: {args.target}）")
     except HumanEvalError as e:

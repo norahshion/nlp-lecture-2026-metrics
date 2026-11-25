@@ -57,10 +57,10 @@ BERTScore は初回に `cl-tohoku/bert-base-japanese-v3`（約450MB）をダウ�
 ## 生成結果（pred_*.jsonl）の変換
 ```powershell
 # データB（ニュース）。分割ごとの入力・出力も付ける（分割単位の BERTScore に必要）
-python convert_pred.py --base ../pred_base.jsonl --target ../pred_lora.jsonl --pipeline ../member_program/dialogue_pipeline.py
+python convert_pred.py --base ../news_res/pred_base.jsonl --target ../news_res/pred_lora.jsonl --pipeline ../member_program/dialogue_pipeline.py
 
 # データA（test.jsonl の生成結果）。id がなければ index から test_000 のような id を作る
-python convert_pred.py --base <base のファイル> --target <lora のファイル> --set A --id-from-index --pipeline ../member_program/dialogue_pipeline.py --out data/outputs_A.jsonl
+python convert_pred.py --base ../data_res/pred_base.jsonl --target ../data_res/pred_lora.jsonl --set A --id-from-index --pipeline ../member_program/dialogue_pipeline.py --out data/outputs_A.jsonl
 ```
 データA と データB は別のファイルに変換し、`run_eval.py --outputs` と `--results` も分けて実行します。
 
@@ -121,6 +121,28 @@ python convert_pred.py --base <base のファイル> --target <lora のファイ
 - 各項目の 1・3・5 点の目安はシートの「説明」に載せています。2・4 点はその中間です。
 - 項目や定義を変えたら `criteria_version` を上げてください。版の違うシートは混ぜて集計できません。
 
+### 規則による採点と抽出（final のみ）
+人が読まなくても点が決まる出力はシートに載せず、`config.yaml` の `human_eval.auto_score` で決めた点を集計時に加えます。判定には日本語判定の結果を使います。
+
+| 日本語判定 | 扱い | 自然さ | 正確性 | 網羅性 | 一貫性 |
+|---|---|---|---|---|---|
+| 出力なし（後処理後の出力が空） | 規則で採点 | 1 | 評価不能（空出力） | 1 | 1 |
+| 不合格（英語など日本語以外） | 規則で採点 | 1 | 評価不能（日本語以外の出力） | 1 | 1 |
+| 要確認・合格 | シートに載せて人が評価 | | | | |
+
+```powershell
+# データB（ニュース5入力）：全件。規則で採点しない件だけがシートに載る
+python human_eval_sheet.py --human-dir human/final_B make --outputs data/outputs.jsonl --raters member1 member2 member3
+# データA（test.jsonl 29入力）：入力を10個抽出（base と lora は対のまま）
+python human_eval_sheet.py --human-dir human/final_A make --outputs data/outputs_A.jsonl --raters member1 member2 member3 --sample-ids 10
+```
+- 作成時に、どの件をシートに載せたか・規則で採点したか・抽出しなかったかを `selection.csv` に記録し、件数を表示します。`meta.json` にも件数と規則を残します。
+- `--sample-ids N` は入力（id）を `seed` で決まる乱数で N 個選びます。同じ設定なら毎回同じ入力が選ばれます。
+- 規則による採点をしない場合は `--no-auto-score` を付けます（従来どおり全件をシートに載せる）。
+- 集計時、規則で採点した件は、記入した評価者ごとに同じ点を置き（1件あたりの重みを人が評価した件とそろえるため。すべて空欄のシートの評価者には置かず、注意を表示します）、`source=規則` として記録します。
+- 規則で採点した件・抽出しなかった件も、作成後に出力が変わっていないか outputs と照合します。
+- 一致度（α）は人が付けた点だけで計算します。規則の点は全員同じ値になり、一致度を実際より高く見せるためです。
+
 ### 空出力・評価不能の扱い
 - **空出力**（評価対象の欄が空、または raw で全分割が空）：自然さ・網羅性・一貫性は 1。正確性は「評価不能」とし、理由に「空出力」を選びます（述べている内容がないため。欠落は網羅性で評価します）。
 - **raw で一部の分割だけが空**：その分割の内容がないものとして、通常どおり評価します。
@@ -129,10 +151,12 @@ python convert_pred.py --base <base のファイル> --target <lora のファイ
 - 1〜5 の整数・「評価不能」・空欄以外の値があると、集計は停止します。
 
 ### 集計の出力
-- `summary`：項目ごとの平均・標準偏差と、`n_valid`（平均に使った評価数）・`n_unable`（評価不能）・`n_blank`（未記入）・`n_total`
+- `summary`：項目ごとの平均・標準偏差と、`n_valid`（平均に使った評価数）・`n_unable`（評価不能）・`n_blank`（未記入）・`n_rule`（規則による採点）・`n_total`、`n_items`（件数）・`n_items_scored`（点数が1つ以上ある件数）。`scope` が「全件（規則による採点を含む）」と「人が評価した件のみ」の2通りを出します。
+- `coverage`：データ×モデルごとの全件数・人が評価した件数・規則で採点した件数（出力なし／日本語以外）・抽出しなかった件数
+- 正確性は規則では「評価不能」になるため、base の正確性の平均は少数の件だけで決まることがあります。`n_items_scored`（グラフでは `n=`）を必ず確認してください。
 - `alpha`：評価者間の一致度（Krippendorff's α、順序尺度）。点数の入った評価だけで計算し、有効件数（`n_valid_ratings`、2人以上が採点した項目数）を併記します。0.67 以上が目安です。
-- `tests`：評価者の平均（点数のみ）を、同じ入力どうしで base と lora 比べた検定。`n` は有効な組の数です。
-- `reasons`：評価不能の理由別の件数
+- `tests`：評価者の平均（点数のみ）を、同じ入力どうしで base と lora 比べた検定。`n` は有効な組の数です。全件（`人的評価(final):…`）と人が評価した件のみ（`人的評価(final・人のみ):…`）の2通りです。
+- `reasons`：評価不能の理由別の件数（`source` で人の記入と規則を区別）
 - 集計時に、評価対象（final/raw）・評価項目・基準の版・対応表がシートと一致するかを確かめ、違えば停止します（final に raw のシートや旧シートが混ざった場合など）。
 
 ## 一括評価
@@ -141,11 +165,12 @@ python run_eval.py                 # BERTScore を含む
 python run_eval.py --no-bertscore  # 形式チェックだけ素早く確認
 ```
 - `human/final/` に final のシートがあれば、人的評価（final）も集計します。raw のフォルダや旧形式のシートを `--human-dir` に渡すと停止します。
+- 集計するのは、評価する outputs と同じデータから作ったシートだけです（`key.csv` の id・データ・モデルと、シートに表示した対話を照合）。既定の `human/final/` が別のデータのシートなら集計せず、出力先に残っていた `human_final_*.csv` を消します。`--human-dir` で指定したフォルダが合わない場合、またはシート作成後に出力が変わっていた場合は停止します。
 - 出力先は `results/` です。条件ごとに `--results` で分けると、以前の結果と混同しません。
 
 ### 出力（results/）
 - `summary.csv`：データセット × モデルごとの主要指標（`set=ALL` は全体）
-- `stats.csv`：base と lora を同じ入力どうしで比べた検定（対応のある t検定・Wilcoxon）
+- `stats.csv`：base と lora を同じ入力どうしで比べた検定（対応のある t検定・Wilcoxon）。p 値は丸めずに残し、`*_表示` 列に「p<0.001」「p=0.062」の形で示します。0/1 の指標は `推奨` 列のとおり Wilcoxon を使います
 - `summary.png`：スライド用のグラフ
 - `format_detail.csv` / `bertscore_detail.csv`：1件ごとの結果（失敗例を探すときに使う）
 - `human_final_*.csv`：人的評価（final）の詳細・平均・一致度・評価不能の理由

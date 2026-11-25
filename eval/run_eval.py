@@ -11,6 +11,7 @@ human_eval_sheet.py aggregate --target raw で別に集計する（summary・sta
   results/bertscore_detail.csv  1件ごとの BERTScore（トークン数・切り捨ての有無つき）
   results/bertscore_chunk_detail.csv  分割ごとの BERTScore（分割情報がある場合）
   results/human_final_*.csv     人的評価（final）。human/final/ に記入済みシートがある場合
+                                （coverage: 人が評価・規則で採点・抽出外の件数）
   results/summary.csv           データセット × モデルごとの主要指標
   results/stats.csv             base と lora の対応のある検定
   results/summary.png           スライド用のグラフ
@@ -26,7 +27,7 @@ import pandas as pd
 
 import metric_format
 from common import ROOT, load_config, load_records, paired_test
-from human_eval_sheet import HumanEvalError, run_aggregate
+from human_eval_sheet import SCOPES, HumanEvalError, match_records, run_aggregate
 
 FORMAT_COL = "後処理後の形式遵守率(%)"
 
@@ -59,9 +60,19 @@ def build_summary(fmt_sum, bs_sum, human) -> pd.DataFrame:
     if bs_sum is not None:
         s = s.merge(bs_sum[["set", "model", *BS_COLS]].rename(columns=BS_COLS), on=["set", "model"], how="left")
     if human is not None:
-        h = human["summary"].pivot_table(index=["set", "model"], columns="criterion", values="mean")
-        h.columns = [f"人的評価(final):{c}" for c in h.columns]
-        s = s.merge(h.reset_index(), on=["set", "model"], how="left")
+        hs = human["summary"]
+        for scope, label in ((SCOPES["all"], "人的評価(final)"), (SCOPES["human"], "人的評価(final・人のみ)")):
+            hh = hs[hs["scope"] == scope]
+            h = hh.pivot_table(index=["set", "model"], columns="criterion", values="mean")
+            h.columns = [f"{label}:{c}" for c in h.columns]
+            s = s.merge(h.reset_index(), on=["set", "model"], how="left")
+            if scope == SCOPES["all"]:  # 平均に使った件数（グラフに n= として添える）
+                n = hh.pivot_table(index=["set", "model"], columns="criterion", values="n_items_scored")
+                n.columns = [f"n_件数_{label}:{c}" for c in n.columns]
+                s = s.merge(n.reset_index(), on=["set", "model"], how="left")
+        cov = human["coverage"][["set", "model", "n_人が評価", "n_規則_出力なし", "n_規則_日本語以外", "n_抽出外"]]
+        cov = cov.rename(columns=lambda c: c.replace("n_", "n_人的評価_", 1) if c.startswith("n_") else c)
+        s = s.merge(cov, on=["set", "model"], how="left")
     return s
 
 
@@ -81,7 +92,19 @@ def build_stats(fmt_detail, bs_detail, human, base, target) -> pd.DataFrame:
     out = pd.DataFrame(rows)
     if human is not None:
         out = pd.concat([out, human["tests"]], ignore_index=True)
-    return out.round(4)
+    # 平均は小数4桁。p 値は丸めずに残し（0.0 と表示されないように）、表示用の列を添える
+    out = out.round({c: 4 for c in out.columns if c.startswith("mean_") or c == "diff_mean"})
+    for c in ("t_p", "wilcoxon_p"):
+        out[f"{c}_表示"] = out[c].map(format_p)
+    # 0/1 の指標に t 検定は向かないため、発表には wilcoxon_p を使う
+    out["推奨"] = ["wilcoxon_p" if m.endswith("(0/1)") else "" for m in out["metric"]]
+    return out
+
+
+def format_p(p) -> str:
+    if p is None or (isinstance(p, float) and math.isnan(p)):
+        return ""
+    return "p<0.001" if p < 0.001 else f"p={p:.3f}"
 
 
 def plot_summary(summary: pd.DataFrame, base: str, target: str, path: Path):
@@ -96,6 +119,7 @@ def plot_summary(summary: pd.DataFrame, base: str, target: str, path: Path):
 
     metrics = [c for c in summary.columns
                if c not in ("set", "model", "n", REVIEW_COL) and not c.startswith("n_")
+               and "人のみ" not in c  # グラフは全件（規則による採点を含む）の平均だけ
                and (summary[c].notna().any() or c == "全分割合格率(%)")]  # 3種類の判定は常に並べる
     sets = [s for s in summary["set"].unique() if s != "ALL"] or ["ALL"]
 
@@ -114,7 +138,9 @@ def plot_summary(summary: pd.DataFrame, base: str, target: str, path: Path):
             sel = [(summary.set == s) & (summary.model == model) for s in sets]
             reviews = [summary.loc[q, REVIEW_COL].mean() if m == "日本語合格率(%)" else 0 for q in sel]
             excluded = [summary.loc[q, TRUNC_OF[m]].sum() if m in TRUNC_OF else 0 for q in sel]
-            for b, v, rv, ex in zip(bars, vals, reviews, excluded):
+            ncol = f"n_件数_{m}"
+            n_scored = [summary.loc[q, ncol].sum() if ncol in summary else None for q in sel]
+            for b, v, rv, ex, ns in zip(bars, vals, reviews, excluded, n_scored):
                 if math.isnan(v):
                     if ex > 0:  # 全件が切り捨てで除かれた
                         ax.annotate(f"除外{int(ex)}", (b.get_x() + b.get_width() / 2, 0), ha="center",
@@ -126,6 +152,8 @@ def plot_summary(summary: pd.DataFrame, base: str, target: str, path: Path):
                     label += f"\n(+要確認{rv:.1f})"
                 if ex > 0:
                     label += f"\n(除外{int(ex)})"
+                if ns is not None:
+                    label += f"\n(n={int(ns)})"
                 ax.annotate(label, (b.get_x() + b.get_width() / 2, b.get_height()),
                             ha="center", va="bottom", fontsize=8, color="#3d3d3a",
                             xytext=(0, 2), textcoords="offset points")
@@ -160,8 +188,9 @@ def main():
     ap = argparse.ArgumentParser(description="対話変換システムの評価")
     ap.add_argument("--outputs", default=str(ROOT / "data" / "outputs.jsonl"))
     ap.add_argument("--config", default=None)
-    ap.add_argument("--human-dir", default=str(ROOT / "human" / "final"),
-                    help="final（後処理後の出力）の人的評価シートのフォルダ")
+    ap.add_argument("--human-dir", default=None,
+                    help="final（後処理後の出力）の人的評価シートのフォルダ。既定: human/final/"
+                         "（評価対象と別のデータのシートなら集計しない）")
     ap.add_argument("--results", default=str(ROOT / "results"))
     ap.add_argument("--no-bertscore", action="store_true", help="BERTScore を計算しない")
     args = ap.parse_args()
@@ -194,19 +223,37 @@ def main():
             print(f"  [注意] 512トークン超のため集計から除いた件数: 正解比 {n_tr['vs_ref']} / "
                   f"入力比・全文 {n_tr['vs_src']} / 入力比・分割単位 {n_tr['chunk']}（detail には値を残しています）")
 
+    human_dir = Path(args.human_dir) if args.human_dir else ROOT / "human" / "final"
     try:
-        human = run_aggregate(Path(args.human_dir), cfg, target="final")
+        # シートが評価対象と同じデータから作られたかを先に確かめる（別データの人的評価を混ぜない）
+        try:
+            match = match_records(human_dir, records, target="final")
+        except HumanEvalError as e:
+            if args.human_dir:  # 明示したフォルダが合わないときは停止
+                raise
+            print(f"  [注意] {e}")
+            match = "unrelated"  # 既定のフォルダが合わないときは集計しない
+        if match == "unrelated" and args.human_dir:
+            raise HumanEvalError(f"{human_dir} のシートは、評価対象の outputs と id が1件も一致しません")
+        human = run_aggregate(human_dir, cfg, target="final") if match == "match" else None
     except HumanEvalError as e:
         print(f"[停止] 人的評価: {e}", file=sys.stderr)
         sys.exit(1)
-    if human is None:
+    if match == "unrelated":
+        print(f"[指標2] 人的評価(final): {human_dir} は別のデータのシートのため集計しません"
+              "（このデータの人的評価は --human-dir で指定してください）")
+    elif human is None:
         print("[指標2] 人的評価(final): シートがないためスキップ")
+    if human is None:  # 以前の実行で残った人的評価の結果を、このデータの結果と誤解しないように消す
+        for name in ("detail", "summary", "alpha", "reasons", "coverage"):
+            (out / f"human_final_{name}.csv").unlink(missing_ok=True)
     else:
         d = human["detail"]
-        print(f"[指標2] 人的評価(final): 評価者 {d['rater'].nunique()} 人分を集計"
-              f"（数値 {(d.status == '数値').sum()} / 評価不能 {(d.status == '評価不能').sum()}"
-              f" / 未記入 {(d.status == '未記入').sum()}）")
-        for name in ("detail", "summary", "alpha", "reasons"):
+        dh = d[d["source"] == "人"]
+        print(f"[指標2] 人的評価(final): 評価者 {dh.loc[dh['status'] != '未記入', 'rater'].nunique()} 人分を集計"
+              f"（人の記入: 数値 {(dh.status == '数値').sum()} / 評価不能 {(dh.status == '評価不能').sum()}"
+              f" / 未記入 {(dh.status == '未記入').sum()}、規則による採点 {(d.source == '規則').sum()}）")
+        for name in ("detail", "summary", "alpha", "reasons", "coverage"):
             human[name].to_csv(out / f"human_final_{name}.csv", index=False, encoding="utf-8-sig")
 
     summary = build_summary(fmt_sum, bs_sum, human).round(3)
